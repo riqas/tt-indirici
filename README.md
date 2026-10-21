@@ -1,6 +1,9 @@
+<img src="docs/logo.png" width="64" align="left" alt="">
+
 # TT İndirici
 
 TikTok'tan doğrudan **filigransız MP4** ve **MP3** indiren, Windows için sade bir masaüstü uygulaması.
+<br clear="left">
 
 ![TT İndirici](docs/ekran.png)
 
@@ -9,17 +12,20 @@ doğrudan indirir, MP3'e çevirme işini de senin bilgisayarında ffmpeg yapar. 
 
 ## Özellikler
 - Filigransız video (TikTok logosu ve kullanıcı adı yazısı olmadan)
-- Birden çok link aynı anda; kısa linkler (`vm.tiktok.com`, `vt.tiktok.com`) çalışır
-- Profil, etiket (`/tag/`) ve müzik (`/music/`) linkleri tek tek videolara açılır
-- Aynı anda 1–6 indirme
+- Birden çok link aynı anda; tarayıcıdan, telefondan paylaşılan, kısa (`vm.tiktok.com`) ve gömülü (embed) linkler çalışır.
+  Aynı video iki kez yapıştırılırsa bir kez iner.
+- Profil linki (`tiktok.com/@kullanıcı`) profildeki videolara tek tek açılır
+- Aynı anda 1–6 indirme; daha önce indirilen dosya yeniden indirilmez
 - MP4 iki seçenekle:
   - **Her yerde açılır:** H.264, her oynatıcıda, telefonda ve düzenleme programında açılır
   - **En yüksek çözünürlük:** TikTok yüksek çözünürlüğü çoğu zaman yalnız H.265 olarak veriyor; Windows'ta
     oynatmak için Microsoft Store'daki HEVC eklentisi gerekebilir
 - MP3: 320 / 256 / 192 / 128 kbps, videoda duyduğun ses; kapak resmi ve etiketler dosyaya gömülür
-- İptal, kaldığı yerden yeniden deneme, `yt-dlp güncelle` düğmesi
+- İptal (yarım dosya bırakmaz), bağlantı koparsa otomatik yeniden deneme, `yt-dlp güncelle` düğmesi
+- GoodbyeDPI açıkken de çalışır
 
-Desteklenmeyen: fotoğraf (slayt) gönderileri, gizli hesaplar.
+Desteklenmeyen: fotoğraf (slayt) gönderileri, etiket (`/tag/`) ve müzik (`/music/`) sayfaları, gizli hesaplar.
+Uygulama bunları açılmadan önce tanır ve nedenini yazar.
 
 ## Kurulum ve kullanım
 1. **[TT-Indirici.zip indir](../../releases/latest/download/TT-Indirici.zip)** (her zaman son sürüm) ve zip'i bir klasöre aç.

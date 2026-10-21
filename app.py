@@ -9,15 +9,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QEasingCurve, QObject, QPropertyAnimation, QRectF, QRunnable, QSettings, Qt, QThreadPool, pyqtSignal,
+    QEasingCurve, QObject, QPointF, QPropertyAnimation, QRectF, QRunnable, QSettings, Qt, QThreadPool, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QKeySequence, QLinearGradient, QPainter,
-    QPainterPath, QPixmap, QShortcut,
+    QPainterPath, QPixmap, QShortcut, QTransform,
 )
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
@@ -30,6 +31,7 @@ from yt_dlp.utils import DownloadCancelled
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = Path.home() / "Downloads" / "TT Indirici"
+LOCAL_FFMPEG = APP_DIR / "ffmpeg" / "bin" / "ffmpeg.exe"
 
 MP3_QUALITIES = ["320", "256", "192", "128"]
 # TikTok yüksek çözünürlüğü çoğu zaman yalnız H.265 veriyor; Windows'ta H.265 için ücretli codec eklentisi gerekebiliyor
@@ -58,7 +60,8 @@ FRIENDLY_ERRORS = (
     ("secondary user ID", "Profil açılamadı. Hesap gizli olabilir ya da TikTok erişimi kısıtladı."),
     ("private", "Bu gönderi gizli."),
     ("Video not available", "Video kaldırılmış ya da bölgende açık değil."),
-    ("status code 10204", "Video kaldırılmış ya da bölgende açık değil."),
+    # TikTok'un 10204 kodu: yt-dlp "IP engeli" diyor ama silinmiş/olmayan gönderide de bu dönüyor
+    ("IP address is blocked", "Video bulunamadı: silinmiş ya da bölgende kapalı."),
     # silinmiş videonun kısa linki ana sayfaya yönleniyor
     ("Unsupported URL: https://www.tiktok.com/?", "Link bir videoya gitmiyor, video silinmiş olabilir."),
     ("Unsupported URL", "Bu link tanınmadı. TikTok video ya da profil linki yapıştır."),
@@ -126,6 +129,9 @@ def build_opts(fmt, quality, out_dir):
         "noprogress": True,
         **NET_OPTS,
     }
+    # başlatıcının indirdiği ffmpeg: PATH'e güvenme (app.py doğrudan açılırsa PATH'te olmaz)
+    if LOCAL_FFMPEG.exists():
+        opts["ffmpeg_location"] = str(LOCAL_FFMPEG.parent)
     if fmt == "mp3":
         opts.update({
             # "audio" biçimi videodaki ses değil, şarkının ayrı kaydı (uzunluğu farklı olabiliyor):
@@ -166,7 +172,20 @@ class DownloadJob(QRunnable):
         self.fmt, self.quality, self.out_dir = fmt, quality, out_dir
         self.cancel, self.s = cancel, signals
         self.final_path = ""
+        self.video_id = ""
         self.phase = 0
+
+    def _remove_leftovers(self, since):
+        """İptalde yarım kalanları sil (.part, MP3'e çevrilmeyi bekleyen video, kapak resmi).
+        Dosya adında video id'si var; bu işten önce var olan dosyalara (ör. aynı videonun öbür biçimi) dokunma."""
+        if not self.video_id:
+            return
+        for p in Path(self.out_dir).glob(f"*[[]{self.video_id}[]]*"):
+            try:
+                if p.stat().st_mtime >= since - 1:
+                    p.unlink()
+            except OSError:
+                pass
 
     def _hook(self, d):
         if self.cancel.is_set():
@@ -208,18 +227,26 @@ class DownloadJob(QRunnable):
             "postprocessor_hooks": [self._pp_hook],
             "post_hooks": [lambda path: setattr(self, "final_path", path)],
         })
+        started = time.time()
         for attempt in range(1, MAX_ATTEMPTS + 1):
             self.s.status.emit(self.job_id, "Bağlanıyor" if attempt == 1 else f"Tekrar deneniyor ({attempt})")
             logger.last_error = ""
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    code = ydl.download([self.url])
-                if code == 0:
-                    msg = "Tamam" if self.phase else "Zaten var"
-                    self.s.done.emit(self.job_id, True, msg, self.final_path)
-                    return
-                err = logger.last_error
+                    info = ydl.extract_info(self.url, download=False)
+                    self.video_id = info.get("id", "")
+                    if info.get("title"):
+                        self.s.title.emit(self.job_id, info["title"])
+                    # yt-dlp MP3'te dosya varken videoyu yeniden indirip üstüne yazıyor: önce hedefe bak
+                    target = Path(ydl.prepare_filename(info)).with_suffix(f".{self.fmt}")
+                    if target.exists():
+                        self.s.done.emit(self.job_id, True, "Zaten var", str(target))
+                        return
+                    ydl.process_ie_result(info, download=True)
+                self.s.done.emit(self.job_id, True, "Tamam", self.final_path)
+                return
             except DownloadCancelled:
+                self._remove_leftovers(started)
                 self.s.done.emit(self.job_id, False, "İptal edildi", "")
                 return
             except Exception as e:  # noqa: BLE001 — her hatayı satırda göster, uygulamayı düşürme
@@ -259,21 +286,38 @@ class ProfileResolver(QRunnable):
                 if url:
                     entries.append((url, e.get("title") or url))
             if not entries:
-                self.s.done.emit(self.job_id, False, "Profilde video yok", "")
+                self.s.done.emit(self.job_id, False, "Bu sayfada video bulunamadı", "")
             else:
                 self.s.expanded.emit(self.job_id, entries)
         except Exception as e:  # noqa: BLE001
             self.s.done.emit(self.job_id, False, clean_error(logger.last_error or e), "")
 
 
+def is_tiktok(url):
+    return bool(re.match(r"https?://([\w-]+\.)*tiktokv?\.com/", url))
+
+
 def is_profile(url):
-    """Profil, etiket, müzik ve koleksiyon linkleri birden çok videoya açılır."""
-    return bool(re.search(r"tiktok\.com/(@[\w.-]+/?(?:[?#]|$)|@[\w.-]+/collection/|tag/|music/)", url))
+    """Profil ve koleksiyon linkleri birden çok videoya açılır."""
+    return bool(re.search(r"tiktok\.com/(@[\w.-]+/?(?:[?#]|$)|@[\w.-]+/collection/)", url))
 
 
-def is_photo(url):
-    """Fotoğraf (slayt) gönderileri: yt-dlp bunları desteklemiyor."""
-    return "/photo/" in url
+def unsupported(url):
+    """yt-dlp'nin şu an açamadığı TikTok sayfaları: neden açılmadığını hemen söyle."""
+    if not is_tiktok(url):
+        return "TikTok linki değil."
+    if "/photo/" in url:
+        return "Fotoğraf (slayt) gönderileri desteklenmiyor, yalnız videolar."
+    # etiket ve müzik sayfaları TikTok'un mobil uygulama API'sini istiyor, yt-dlp'de çalışmıyor (2026-10)
+    if re.search(r"tiktok\.com/(tag|music)/", url):
+        return "Etiket ve müzik sayfaları desteklenmiyor. Video ya da profil linki yapıştır."
+    return ""
+
+
+def canonical(url):
+    """Gömülü (embed) ve eski mobil linkleri normal video linkine çevir; yoksa genel çıkarıcıya düşüyorlar."""
+    m = re.search(r"tiktok\.com/(?:embed(?:/v2)?|v)/(\d{15,})", url)
+    return f"https://www.tiktok.com/@/video/{m.group(1)}" if m else url
 
 
 # ---------- görünüm ----------
@@ -289,6 +333,7 @@ QWidget#root, QWidget#list {{ background: {C['bg']}; }}
 QLabel#h1 {{ font-size: 18pt; font-weight: 700; }}
 QLabel#muted {{ color: {C['muted']}; }}
 QLabel#faint {{ color: {C['faint']}; font-size: 9pt; }}
+QLabel#credit {{ color: {C['faint']}; font-size: 8.5pt; }}
 QLabel#section {{ color: {C['muted']}; font-size: 8.5pt; font-weight: 700; letter-spacing: 1px; }}
 QLabel#empty {{ color: {C['muted']}; font-size: 10.5pt; }}
 QFrame#card {{ background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 14px; }}
@@ -323,6 +368,7 @@ QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:
     border-radius: 2px; }}
 QProgressBar[state="done"]::chunk {{ background: {C['ok']}; }}
 QProgressBar[state="error"]::chunk {{ background: {C['err']}; }}
+QProgressBar[state="cancelled"]::chunk {{ background: {C['line2']}; }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
 QScrollBar::handle:vertical {{ background: {C['line2']}; border-radius: 3px; min-height: 30px; }}
@@ -378,7 +424,7 @@ def tint(hex_color, alpha):
 
 
 def logo_pixmap(px):
-    """Turkuazdan pembeye yuvarlak kare + beyaz aşağı ok (pencere ve görev çubuğu ikonu)."""
+    """Pembe yuvarlak kare + kalın beyaz nota (pencere ve görev çubuğu ikonu)."""
     dpr = 2.0
     pm = QPixmap(int(px * dpr), int(px * dpr))
     pm.setDevicePixelRatio(dpr)
@@ -386,18 +432,28 @@ def logo_pixmap(px):
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     grad = QLinearGradient(0, 0, px, px)
-    grad.setColorAt(0, QColor("#1fd6d0"))
-    grad.setColorAt(1, QColor("#fe2c55"))
+    grad.setColorAt(0, QColor("#ff4d6f"))
+    grad.setColorAt(1, QColor("#e8204a"))
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(grad)
     p.drawRoundedRect(QRectF(0, 0, px, px), px * 0.26, px * 0.26)
-    arrow = QPainterPath()
-    for x, y in ((0.43, 0.24), (0.57, 0.24), (0.57, 0.48), (0.70, 0.48), (0.50, 0.70), (0.30, 0.48), (0.43, 0.48)):
-        (arrow.lineTo if arrow.elementCount() else arrow.moveTo)(px * x, px * y)
-    arrow.closeSubpath()
+    note = QPainterPath()
+    note.setFillRule(Qt.FillRule.WindingFill)
+    head = QPainterPath()
+    head.addEllipse(QPointF(0, 0), px * 0.135, px * 0.105)
+    note.addPath(QTransform().translate(px * 0.415, px * 0.695).rotate(-22).map(head))
+    stem = px * 0.505
+    note.addRoundedRect(QRectF(stem, px * 0.22, px * 0.075, px * 0.48), px * 0.02, px * 0.02)
+    flag = QPainterPath()
+    flag.moveTo(stem, px * 0.22)
+    flag.cubicTo(px * 0.60, px * 0.22, px * 0.62, px * 0.30, px * 0.74, px * 0.34)
+    flag.cubicTo(px * 0.80, px * 0.36, px * 0.78, px * 0.42, px * 0.73, px * 0.43)
+    flag.cubicTo(px * 0.66, px * 0.38, px * 0.62, px * 0.37, stem + px * 0.07, px * 0.37)
+    flag.lineTo(stem, px * 0.37)
+    flag.closeSubpath()
+    note.addPath(flag)
     p.setBrush(QColor("white"))
-    p.drawPath(arrow)
-    p.drawRoundedRect(QRectF(px * 0.28, px * 0.74, px * 0.44, px * 0.07), px * 0.035, px * 0.035)
+    p.drawPath(note)
     p.end()
     return pm
 
@@ -482,11 +538,14 @@ class JobRow(QFrame):
 
     def _paint_tile(self):
         glyph = {"mp3": G_MUSIC, "mp4": G_VIDEO, "list": G_LIST}[self.kind]
-        color = {"queued": C["muted"], "active": C["accent"], "done": C["ok"], "error": C["err"]}[self.state]
+        color = {"queued": C["muted"], "active": C["accent"], "done": C["ok"], "error": C["err"],
+                 "cancelled": C["muted"]}[self.state]
         if self.state == "done":
             glyph = G_CHECK
         elif self.state == "error":
             glyph = G_ERROR
+        elif self.state == "cancelled":
+            glyph = G_CANCEL
         bg = C["surface2"] if self.state == "queued" else tint(color, 0.14)
         self.tile.setPixmap(glyph_pixmap(glyph, color, 40, bg=bg, radius=10))
 
@@ -514,7 +573,7 @@ class JobRow(QFrame):
         self.meta.setText(" · ".join(x for x in (speed, f"{eta} kaldı" if eta else "") if x))
 
     def finish(self, ok, msg, path=""):
-        self.state = "done" if ok else "error"
+        self.state = "done" if ok else "cancelled" if msg == "İptal edildi" else "error"
         self.path = path
         self.anim.stop()
         self.bar.setValue(1000 if ok else max(self.bar.value(), 1000))
@@ -525,7 +584,7 @@ class JobRow(QFrame):
         self.meta.setText("")
         self.status.setText(msg)
         self.status.setToolTip(msg)
-        self.status.setStyleSheet(f"color: {C['ok'] if ok else C['err']};")
+        self.status.setStyleSheet(f"color: {C[{'done': 'ok', 'error': 'err'}.get(self.state, 'muted')]};")
         self.btn.setVisible(ok and bool(path))
         self._paint_tile()
 
@@ -552,7 +611,7 @@ class Window(QMainWindow):
         self.signals.expanded.connect(self.on_expanded)
         self.rows = {}        # sürmekte olan job id → JobRow
         self.all_rows = []
-        self.n_ok = self.n_err = 0
+        self.n_ok = self.n_err = self.n_cancel = 0
         self.cancel = threading.Event()
         self.active = 0
         self._build()
@@ -689,7 +748,14 @@ class Window(QMainWindow):
         self.btn_cancel.clicked.connect(self.cancel_all)
         foot.addWidget(clear)
         foot.addWidget(self.btn_cancel)
-        lay.addLayout(foot)
+        bottom = QVBoxLayout()
+        bottom.setSpacing(2)
+        bottom.addLayout(foot)
+        credit = QLabel("by riqas", objectName="credit")
+        credit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        credit.setContentsMargins(0, 0, 6, 0)
+        bottom.addWidget(credit)
+        lay.addLayout(bottom)
 
         self.setCentralWidget(root)
         self.seg.buttonClicked.connect(lambda _: self._format_changed())
@@ -745,11 +811,16 @@ class Window(QMainWindow):
         self.settings.setValue("fmt", self.fmt())
         self.settings.setValue("quality", self.quality.currentText())
         self.settings.setValue("parallel", int(self.parallel.currentText()))
-        for u in dict.fromkeys(urls):
-            if is_photo(u):
+        # aynı video farklı link biçimleriyle gelebilir; iki iş aynı dosyaya yazmasın diye video id'sine göre tekilleştir
+        unique = {}
+        for u in map(canonical, urls):
+            m = re.search(r"/video/(\d+)", u)
+            unique.setdefault(m.group(1) if m else u, u)
+        for u in unique.values():
+            if reason := unsupported(u):
                 job_id = self.add_row(u)
                 self.active += 1
-                self.on_done(job_id, False, "Fotoğraf (slayt) gönderileri desteklenmiyor, yalnız videolar.", "")
+                self.on_done(job_id, False, reason, "")
             elif is_profile(u):
                 job_id = self.add_row(u, "list")
                 self.on_status(job_id, "Profil açılıyor")
@@ -792,7 +863,7 @@ class Window(QMainWindow):
             row.deleteLater()
         self.all_rows.clear()
         self.rows.clear()
-        self.n_ok = self.n_err = 0
+        self.n_ok = self.n_err = self.n_cancel = 0
         self.empty.show()
         self.refresh_summary()
 
@@ -803,7 +874,10 @@ class Window(QMainWindow):
 
     def on_status(self, job_id, text):
         if row := self.rows.get(job_id):
+            was = row.state
             row.set_status(text)
+            if row.state != was:
+                self.refresh_summary()
 
     def on_progress(self, job_id, pct, speed, eta):
         if row := self.rows.get(job_id):
@@ -817,8 +891,12 @@ class Window(QMainWindow):
         row.finish(ok, msg, path)
         if ok:
             self.n_ok += 1
+        elif row.state == "cancelled":
+            self.n_cancel += 1
         else:
             self.n_err += 1
+        if self.active == 0 and self.cancel.is_set():
+            self.hint.setText("İptal edildi.")
         self.refresh_summary()
 
     def on_expanded(self, job_id, entries):
@@ -835,11 +913,18 @@ class Window(QMainWindow):
     def refresh_summary(self):
         parts = []
         if self.active:
-            parts.append(f"<span style='color:{C['text']}'><b>{self.active}</b> sürüyor</span>")
+            # paralel sınırı yüzünden bir kısmı sırada bekliyor: ikisini ayrı göster
+            queued = sum(1 for r in self.rows.values() if r.state == "queued")
+            if self.active - queued:
+                parts.append(f"<span style='color:{C['text']}'><b>{self.active - queued}</b> iniyor</span>")
+            if queued:
+                parts.append(f"<span style='color:{C['muted']}'>{queued} sırada</span>")
         if self.n_ok:
             parts.append(f"<span style='color:{C['ok']}'>{self.n_ok} bitti</span>")
         if self.n_err:
             parts.append(f"<span style='color:{C['err']}'>{self.n_err} hata</span>")
+        if self.n_cancel:
+            parts.append(f"<span style='color:{C['muted']}'>{self.n_cancel} iptal</span>")
         self.summary.setText("  ·  ".join(parts) or "Hazır")
 
     # ---------- yardımcılar ----------
